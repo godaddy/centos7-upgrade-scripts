@@ -1,0 +1,286 @@
+#!/usr/bin/env ansible-playbook --forks 50 -u os_svc -v
+#
+# Copyright 2015 Go Daddy
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+- hosts: '{{ hosts }}'
+  sudo: yes
+  vars:
+    - skip_package_check: false
+    - package_list_file: cent7-preupgrade-package-list.txt
+  tasks:
+
+
+################################
+# Setup
+################################
+
+  # Sanity check initial package list
+  - name: Copy pre-upgrade package list file
+    copy: src={{ package_list_file }} dest=/root/cent7-preupgrade-package-list.txt
+    when: skip_package_check == false
+
+  - name: Sanity check pre-upgrade package list (make sure we're at a known good starting point.  Run with -e "skip_package_check=true" to override.)
+    shell: >
+            rpm -qa | sort |
+              grep -v ^pbis-enterprise |
+              grep -v ^cpm-graphite-collector |
+              grep -v ^netxen-firmware |
+              grep -v ^authconfig |
+              grep -v ^libitm |
+              grep -v ^system-config-firewall-base |
+              diff -u - /root/cent7-preupgrade-package-list.txt
+    when: skip_package_check == false
+
+  # Set maintenance mode in monitoring systems
+  # (Go Daddy-specific commands removed)
+
+  # Disable the nova-compute agent on this host
+  - name: Disable nova-compute agent
+    shell: . /root/keystonerc_admin && nova service-disable 'api!phx_private_cell_001@'{{ inventory_hostname }} nova-compute
+    delegate_to: nova_api_host
+
+  # Record list of running VMs on this host
+  - name: Record running VMs list
+    shell: . /root/keystonerc_admin && openstack server list --all-projects --status ACTIVE --host {{ inventory_hostname }} -c ID -f csv | grep -v ID
+    delegate_to: nova_api_host
+    register: vmslist
+
+  # Dump list of VM UUIDs in case we need to start them manually later
+  - name: List running VMs
+    debug: msg={{ item }}
+    with_items: vmslist.stdout_lines
+
+
+################################
+# Phase One
+################################
+
+  # Run the first stage of the upgrade scripts
+  - name: Upgrade scripts stage one (should take 15-20 minutes) (if errors, see logs at /root/upgrade-tool-output.txt and /root/preupg-output.txt)
+    script: cent7-upgrade.sh creates=/root/preupgrade/postupgrade.d/zz_grub_fixup.sh
+    register: result_stage1
+
+  # Make sure biosdevname is really installed
+  - name: Install biosdevname
+    yum: name=biosdevname
+    register: result_biosdevname_install
+    until: result_biosdevname_install|success
+    delay: 5
+
+  # Sanity checks, and pause
+  - name: Sanity check contents of rc.local
+    shell: grep libsasl2 /etc/rc.local && grep libpcre /etc/rc.local && grep ovs-vsctl /etc/rc.local && grep em1 /etc/rc.local && grep em3 /etc/rc.local && grep python2.7 /etc/rc.local
+    when: not result_stage1|skipped
+
+  - name: Sanity check biosdevname is installed and executable
+    shell: "rpm -q biosdevname && [ -x /sbin/biosdevname ]"
+
+  - name: Sanity check grub config for upgrade tool
+    shell: /sbin/grubby --default-kernel | grep redhat-upgrade-tool
+    when: not result_stage1|skipped
+
+  - name: Sanity check postupgrade.d/zz_grub_fixup.sh script
+    shell: cat /root/preupgrade/postupgrade.d/zz_grub_fixup.sh | wc -l | grep '^28$'
+
+  - name: Sanity check nova-compute is stopped
+    shell: "[ `ps awuxf | grep nova-compute | grep -v grep | wc -l` -eq 0 ]"
+    register: result_nova_compute_stopped
+    until: result_nova_compute_stopped|success
+    delay: 5
+
+  - name: Sanity check pause, 5 minutes (cancel early if good to go)
+    pause: minutes={{ 5 }}
+    when: result_nova_compute_stopped|success
+
+  # Reboot to trigger the upgrade
+  - name: reboot stage one
+    command: /sbin/shutdown -r 1
+    async: 0
+    poll: 0
+    ignore_errors: yes
+    when: not result_stage1|skipped
+
+  # Wait for box to go down
+  - name: Waiting for host shutdown (can take 20-30 minutes depending on how long it takes to suspend all the running VMs)
+    wait_for: host={{ inventory_hostname }} port={{ 22 }} timeout={{ 3600 }} state=stopped
+    connection: local
+    sudo: false
+    when: not result_stage1|skipped
+
+  # Wait for box to come back up
+  - name: Waiting for host bootup (this will take 15-20 minutes because the CentOS 7 upgrade is happening now)
+    wait_for: host={{ inventory_hostname }} port={{ 22 }} timeout={{ 7200 }} state=started
+    connection: local
+    sudo: false
+    when: result_stage1|success
+
+  # Verify we can actually log in to the box
+  - name: Validate ability to login 1
+    command: /bin/true
+    register: result_validate_ssh_1
+    until: result_validate_ssh_1|success
+    delay: 5
+    retries: 100
+
+
+################################
+# Phase Two
+################################
+
+  # Run second stage of the upgrade scripts
+  - name: Upgrade scripts stage two
+    script: cent7-afterreboot.sh creates=/etc/yum.repos.d/spacewalk-v7.repo
+    when: result_stage1|success
+    register: result_stage2
+
+  # Change base channel in spacewalk, retry until it succeeds
+  - name: Change base Spacewalk channel
+    script: update_base_channel.py {{ inventory_hostname }}
+    register: result_base_channel
+    delegate_to: spacewalk_api_host
+    when: not result_stage2|skipped
+    until: result_base_channel|success
+    delay: 5
+
+  # Wait until the base channel actually updates
+  - name: Wait for base channel update
+    shell: "/sbin/rhn-channel --list | grep base-v7-64bit"
+    register: result_rhn_channel
+    until: result_rhn_channel|success
+    delay: 5
+
+
+################################
+# Phase Three
+################################
+
+  # Run second stage of the upgrade scripts
+  - name: Upgrade scripts stage three
+    script: cent7-afterspacewalk.sh creates=/boot/grub2/grub.cfg
+    when: result_rhn_channel|success
+    register: result_stage3
+
+  # Sanity checks, and pause
+  - name: Sanity check of default kernel
+    shell: /sbin/grubby --default-kernel | grep vmlinuz-3.10.0-229.20.1.el7.x86_64
+
+  - name: Sanity check of grub bootloader
+    shell: /bin/file -s /dev/sda | grep 'GRand Unified Bootloader' | grep -v 'GRUB version 0.94'
+
+  - name: Sanity check pause, 5 minutes (cancel early if good to go)
+    pause: minutes={{ 5 }}
+
+  # Reboot to finalize everything
+  - name: reboot two
+    command: /sbin/shutdown -r 1
+    async: 0
+    poll: 0
+    ignore_errors: yes
+    when: not result_stage3|skipped
+
+  # Wait for box to go down
+  - name: Waiting for host shutdown
+    wait_for: host={{ inventory_hostname }} port={{ 22 }} timeout={{ 3600 }} state=stopped
+    connection: local
+    sudo: false
+    when: not result_stage3|skipped
+
+  # Wait for box to come back up
+  - name: Waiting for host bootup (typically takes about 5 minutes)
+    wait_for: host={{ inventory_hostname }} port={{ 22 }} timeout={{ 3600 }} state=started
+    connection: local
+    sudo: false
+    when: result_stage3|success
+
+  # Verify we can actually log in to the box
+  - name: Validate ability to login 2
+    command: /bin/true
+    register: result_validate_ssh_2
+    until: result_validate_ssh_2|success
+    delay: 5
+    retries: 100
+
+  # Wait for a minute to make sure everything is fully started
+  - name: Pausing 60s to allow for full bootup (do not cancel this one early!)
+    pause: minutes={{ 1 }}
+
+
+################################
+# Puppet & Server Spec
+################################
+
+  # Run Puppet
+  - name: Running puppet deployment script
+    shell: "/etc/puppet/environments/master/tools/deploy-puppet 1>/var/log/puppet/ansible-puppet-run-{{ ansible_date_time.iso8601 }}a.log 2>&1"
+    register: result_puppet1
+
+  - name: Running puppet deployment script again
+    shell: "/etc/puppet/environments/master/tools/deploy-puppet 1>/var/log/puppet/ansible-puppet-run-{{ ansible_date_time.iso8601 }}b.log 2>&1"
+    register: result_puppet2
+    when: result_puppet1|success
+
+  # Run server spec tests
+  - name: Running server spec tests
+    shell: "cd /usr/local/serverspec && /bin/bundle exec rake spec:common && /bin/bundle exec rake spec:hypervisor"
+    register: result_serverspec
+    when: result_puppet2|success
+
+
+################################
+# VMs Start & Enable Agent
+################################
+
+  # Wait for nova-compute to catch up with the state of things
+  - name: Waiting 180s for nova-compute to restart VMs (do not cancel this one early!)
+    pause: minutes={{ 3 }}
+    when: result_serverspec|success
+
+  # Wait for nova-compute agent to come back online (this should mean all the VMs are started)
+  - name: Validate nova-compute agent is online
+    shell: ". /root/keystonerc_admin && while [ `nova service-list | grep {{ inventory_hostname }} | awk '{print $12}'` == 'down' ] ; do sleep 5 ; done"
+    delegate_to: nova_api_host
+    register: result_nova_compute_online
+    until: result_nova_compute_online|success
+    delay: 5
+    retries: 100
+    when: result_serverspec|success
+
+  # Verify all the VMs started
+  - name: Verify VMs are active
+    shell: . /root/keystonerc_admin && openstack server show {{ item }} -c status -f value | grep ACTIVE
+    delegate_to: nova_api_host
+    register: result_check_vm_active
+    until: result_check_vm_active|success
+    delay: 5
+    retries: 100
+    with_items: vmslist.stdout_lines
+
+  # Enable nova-compute agent
+  - name: Enable nova-compute agent
+    shell: . /root/keystonerc_admin && nova service-enable 'api!phx_private_cell_001@'{{ inventory_hostname }} nova-compute
+    delegate_to: nova_api_host
+    register: result_service_enable
+    until: result_service_enable|success
+    delay: 2
+    when: result_check_vm_active|success
+
+
+################################
+# Teardown
+################################
+
+  # Clear maintenance mode in monitoring systems
+  # (Go Daddy-specific commands removed)
