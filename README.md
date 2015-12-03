@@ -62,7 +62,7 @@ This is a big problem, because it'll cause the system to hang after the reboot w
 
 Under CentOS 7/systemd, the naming of ethernet NICs changes from the ethN scheme to "predictable device naming" (which in my opinion is not that predictable.)  (See [these](http://www.freedesktop.org/wiki/Software/systemd/PredictableNetworkInterfaceNames/) two  [posts](https://major.io/2015/08/21/understanding-systemds-predictable-network-device-names/) for details)  In any case, you need to change the network configuration with the new device names to handle this.
 
-We handled this by (shimming in the necessary network reconfiguration commands into `/etc/rc.local`)[], which get ran when the host reboots after the upgrade is completed.  See [cent7-upgrade.sh]() for details.  Note also that our hosts are using Open vSwitch (since they are OpenStack hypervisors), so you'll need to adjust the network configuration according to your particular setup.  You will probably want to make sure the `biosdevname` package is installed to make the device naming a little simpler.
+We handled this by shimming in the necessary network reconfiguration commands into `/etc/rc.local`, which get ran when the host reboots after the upgrade is completed.  See [cent7-upgrade.sh](https://github.com/godaddy/centos7-upgrade-scripts/blob/master/cent7-upgrade.sh#L119-L127) for details.  Note also that our hosts are using Open vSwitch (since they are OpenStack hypervisors), so you'll need to adjust the network configuration according to your particular setup.  You will probably want to make sure the `biosdevname` package is installed to make the device naming a little simpler.
 
 ### VMs go to SHUTDOWN state after upgrade is completed
 
